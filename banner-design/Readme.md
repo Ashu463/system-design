@@ -32,9 +32,15 @@
   - [Deep Dives](#deep-dives)
     - [Flow 1 — Fetch Banners](#flow-1--fetch-banners)
     - [Flow 2 — View Event Pipeline](#flow-2--view-event-pipeline)
+    - [Example walkthrough](#example-walkthrough)
     - [Caching Strategy](#caching-strategy)
     - [Idempotency](#idempotency)
     - [Fault Tolerance](#fault-tolerance)
+  - [Low Level Design](#low-level-design)
+    - [Class Structure - Banner Service](#class-structure---banner-service)
+    - [Kafka Consumer — View Event Processor](#kafka-consumer--view-event-processor)
+    - [Quota Check — Decision Flow](#quota-check--decision-flow)
+    - [Cache Key Design](#cache-key-design)
   - [Trade-offs](#trade-offs)
   - [Future Optimizations](#future-optimizations)
 
@@ -282,7 +288,7 @@ If count < x_times → show the banner. Else → skip.
 | Banner Service | Core logic — quota check, banner eligibility, response assembly |
 | Redis | Caches view_count + oldest_view_timestamp per (user_id, banner_id) |
 | Kafka | Absorbs high-volume view events asynchronously, decouples client from DB |
-| NoSQL DB | Persists banners and user_views; primary + 2 read replicas |
+| PostgreSQL | Persists banners and user_views; primary + 2 read replicas;  Leverages ACID transactions, foreign keys, and efficient |
 | CDN | Serves banner assets (images, text, CTA) — bypasses backend entirely |
 
 ---
@@ -319,8 +325,19 @@ If count < x_times → show the banner. Else → skip.
    b. Batch write view record to primary DB
    c. Async update Redis: increment view_count, update oldest_view_timestamp if needed
 5. Read replicas sync from primary asynchronously
-```
 
+```
+---
+
+### Example walkthrough
+```
+User A opens Flipkart at 9AM. 
+7Summer Sale banner (X=2, Y=24hrs) has been seen once at 8AM yesterday (25 hours ago — expired). 
+Redis shows view_count=1 but oldest_view_timestamp is 25hrs old so count effectively = 0. 
+Banner is shown. User watches for 3 seconds. 
+POST /views fired. Kafka consumes event. 
+Redis updated to view_count=1 with new timestamp.
+```
 ---
 
 ### Caching Strategy
@@ -366,6 +383,71 @@ This prevents duplicate view counts caused by client retries, network issues, or
 
 ---
 
+## Low Level Design
+
+### Class Structure - Banner Service
+```
+BannerService
+├── fetchEligibleBanners(user_id: UUID): BannerID[]
+│     ├── getActiveBanners(): Banner[]
+│     ├── checkQuota(user_id, banner_id): boolean
+│     │     ├── getCachedQuota(user_id, banner_id): QuotaEntry | null
+│     │     ├── isWindowExpired(oldest_view_timestamp, y_hours): boolean
+│     │     └── fallbackToDb(user_id, banner_id, y_hours): int
+│     └── buildResponse(eligible_banners): BannerID[]
+│
+└── recordViewEvent(event: ViewEvent): void
+├── isIdempotent(event_id): boolean
+├── publishToKafka(event): void
+└── return 202 Accepted
+
+QuotaEntry
+├── view_count: int
+├── oldest_view_timestamp: timestamp
+└── isExpired(y_hours): boolean
+
+ViewEvent
+├── event_id: string         ← idempotency key
+├── user_id: UUID
+├── banner_id: UUID
+├── view_duration_ms: int
+└── dismissed: boolean
+```
+
+### Kafka Consumer — View Event Processor
+```
+ViewEventConsumer
+├── consume(event: ViewEvent): void
+│     ├── checkIdempotency(event_id) → skip if duplicate
+│     ├── batchWrite(event) → primary DB (user_views table)
+│     └── updateCache(user_id, banner_id)
+│           ├── increment view_count
+│           └── update oldest_view_timestamp if this is the new oldest
+│
+└── flush(): void   ← triggered every N events or T milliseconds
+```
+### Quota Check — Decision Flow
+```
+checkQuota(user_id, banner_id, x, y_hours):
+  entry = Redis.get(user_id, banner_id)
+  if entry is null:
+    count = DB.query(user_id, banner_id, y_hours)  ← fallback
+    return count < x
+  if isExpired(entry.oldest_view_timestamp, y_hours):
+    entry.view_count -= 1
+    Redis.set(user_id, banner_id, entry)
+    return entry.view_count < x
+```
+### Cache Key Design
+```
+Key:   banner_quota:{user_id}:{banner_id}
+Value: { view_count: int, oldest_view_timestamp: timestamp }
+TTL:   Y hours (auto-evicts after window expires)
+```
+
+---
+
+
 ## Trade-offs
 
 | Decision | Trade-off |
@@ -373,7 +455,7 @@ This prevents duplicate view counts caused by client retries, network issues, or
 | Eventual consistency | Accepted slight staleness in view counts to avoid distributed locking at 100M scale |
 | Soft quota cap | Allows 1-2 overage views rather than using expensive distributed counters for hard enforcement |
 | Rolling window over fixed reset | More fair to users across time zones but slightly more complex cache logic |
-| NoSQL over SQL | Write-optimized for high-volume user_views inserts; sacrifices complex join queries |
+PostgreSQL over NoSQL | Schema is strongly relational with FK constraints and range queries. Postgres handles this cleanly. Write scale managed via connection pooling (PgBouncer) and read replicas. |
 | Kafka for view events | Decouples client from DB write latency; adds operational complexity |
 | CDN for assets | Removes banner asset serving from hot path; requires asset pre-registration |
 
@@ -387,3 +469,5 @@ This prevents duplicate view counts caused by client retries, network issues, or
 - **Analytics pipeline:** Feed view events into a data warehouse (via Kafka → Flink → S3 → Redshift) for campaign performance dashboards.
 - **A/B testing:** Support multiple creative variants per banner_id and randomly assign users to variants to test which performs better.
 - **Geo-distribution:** Deploy banner service in multiple regions. Route users to nearest region via GeoDNS. Accept cross-region eventual consistency.
+- **Postgres partitioning:** Partition user_views table by view_timestamp monthly. Drop partitions older than Y hours automatically instead of row-level deletes.
+- **PgBouncer:** Connection pooler in front of Postgres to handle 10K+ concurrent connections at peak traffic.
