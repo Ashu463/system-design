@@ -412,6 +412,16 @@ ViewEvent
 ├── banner_id: UUID
 ├── view_duration_ms: int
 └── dismissed: boolean
+
+AdminService
+├── createBanner(payload: CreateBannerPayload): Banner
+│     ├── validate(payload)
+│     │     ├── x_times > 0
+│     │     ├── y_hours > 0
+│     │     ├── z_duration_sec > 0
+│     │     └── start_date < end_date
+│     ├── persist(payload) → primary DB (banners table)
+│     └── return created Banner
 ```
 
 ### Kafka Consumer — View Event Processor
@@ -437,6 +447,8 @@ checkQuota(user_id, banner_id, x, y_hours):
     entry.view_count -= 1
     Redis.set(user_id, banner_id, entry)
     return entry.view_count < x
+
+  return entry.view_count < x
 ```
 ### Cache Key Design
 ```
